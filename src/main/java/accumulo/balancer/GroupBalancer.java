@@ -49,6 +49,7 @@ import org.apache.accumulo.server.master.state.TServerInstance;
 import org.apache.accumulo.server.master.state.TabletMigration;
 import org.apache.accumulo.server.security.SystemCredentials;
 import org.apache.commons.lang.mutable.MutableInt;
+import org.apache.hadoop.io.Text;
 
 import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
@@ -73,6 +74,7 @@ import com.google.common.collect.Table;
 public abstract class GroupBalancer extends TabletBalancer {
 
   private final String tableId;
+  private final Text textTableId;
   private long lastRun = 0;
 
   /**
@@ -82,6 +84,7 @@ public abstract class GroupBalancer extends TabletBalancer {
 
   public GroupBalancer(String tableId) {
     this.tableId = tableId;
+    this.textTableId = new Text(tableId);
   }
 
   protected Iterable<Pair<KeyExtent,Location>> getLocationProvider() {
@@ -95,6 +98,31 @@ public abstract class GroupBalancer extends TabletBalancer {
    */
   protected long getWaitTime() {
     return 60000;
+  }
+
+  /**
+   * The maximum number of migrations to perform in a single pass.
+   */
+  protected int getMaxMigrations() {
+    return 1000;
+  }
+
+  /**
+   * @return Examine current tserver and migrations and return true if balancing should occur.
+   */
+  protected boolean shouldBalance(SortedMap<TServerInstance,TabletServerStatus> current, Set<KeyExtent> migrations) {
+
+    if (current.size() < 2) {
+      return false;
+    }
+
+    for (KeyExtent keyExtent : migrations) {
+      if (keyExtent.getTableId().equals(textTableId)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   @Override
@@ -179,15 +207,13 @@ public abstract class GroupBalancer extends TabletBalancer {
     // G2 | G2 | G2 | G2 | G2 | G2 <-- expected tablets for group 2
     // G3 | G3 | G3 | G3 | G3 | G3 <-- expected tablets for group 3
 
-    if (migrations.size() > 0 || current.size() < 2) {
+    if (!shouldBalance(current, migrations)) {
       return 5000;
     }
 
     if (System.currentTimeMillis() - lastRun < getWaitTime()) {
       return 5000;
     }
-
-    lastRun = System.currentTimeMillis();
 
     MapCounter<String> groupCounts = new MapCounter<>();
     Map<TServerInstance,TserverGroupInfo> tservers = new HashMap<>();
@@ -203,7 +229,7 @@ public abstract class GroupBalancer extends TabletBalancer {
       String group = partitioner.apply(entry.getFirst());
       Location loc = entry.getSecond();
 
-      if (loc.equals(Location.NONE) || !current.containsKey(loc.getTserverInstance())) {
+      if (loc.equals(Location.NONE) || !tservers.containsKey(loc.getTserverInstance())) {
         return 5000;
       }
 
@@ -234,12 +260,21 @@ public abstract class GroupBalancer extends TabletBalancer {
 
     Moves moves = new Moves();
 
+    // The order of the following steps is important, because as ordered each step should not move any tablets moved by a previous step.
     balanceExpected(tservers, moves);
-    balanceExtraExpected(tservers, expectedExtra, moves);
-    balanceExtraMultiple(tservers, maxExtraGroups, moves);
-    balanceExtraExtra(tservers, maxExtraGroups, moves);
+    if (moves.size() < getMaxMigrations()) {
+      balanceExtraExpected(tservers, expectedExtra, moves);
+      if (moves.size() < getMaxMigrations()) {
+        boolean cont = balanceExtraMultiple(tservers, maxExtraGroups, moves);
+        if (cont && moves.size() < getMaxMigrations()) {
+          balanceExtraExtra(tservers, maxExtraGroups, moves);
+        }
+      }
+    }
 
-    populateMigrations(current, migrationsOut, moves);
+    populateMigrations(tservers.keySet(), migrationsOut, moves);
+
+    lastRun = System.currentTimeMillis();
 
     return 5000;
   }
@@ -273,7 +308,7 @@ public abstract class GroupBalancer extends TabletBalancer {
     }
   }
 
-  private static class TserverGroupInfo {
+  static class TserverGroupInfo {
 
     private Map<String,Integer> expectedCounts;
     private final Map<String,MutableInt> initialCounts = new HashMap<>();
@@ -418,6 +453,7 @@ public abstract class GroupBalancer extends TabletBalancer {
   private static class Moves {
 
     private final Table<TServerInstance,String,List<Move>> moves = HashBasedTable.create();
+    private int totalMoves = 0;
 
     public void move(String group, int num, TserverGroupInfo src, TserverGroupInfo dest) {
       Preconditions.checkArgument(num > 0);
@@ -433,6 +469,7 @@ public abstract class GroupBalancer extends TabletBalancer {
       }
 
       srcMoves.add(new Move(dest, num));
+      totalMoves += num;
     }
 
     public TServerInstance removeMove(TServerInstance src, String group) {
@@ -443,6 +480,7 @@ public abstract class GroupBalancer extends TabletBalancer {
 
       Move move = srcMoves.get(srcMoves.size() - 1);
       TServerInstance ret = move.dest.getTserverInstance();
+      totalMoves--;
 
       move.count--;
       if (move.count == 0) {
@@ -453,6 +491,10 @@ public abstract class GroupBalancer extends TabletBalancer {
       }
 
       return ret;
+    }
+
+    public int size() {
+      return totalMoves;
     }
   }
 
@@ -491,21 +533,28 @@ public abstract class GroupBalancer extends TabletBalancer {
               serversGroupsToRemove.add(new Pair<String,TServerInstance>(group, srcTgi.getTserverInstance()));
             }
 
-            if (destTgi.getExtras().size() >= maxExtraGroups) {
+            if (destTgi.getExtras().size() >= maxExtraGroups || moves.size() >= getMaxMigrations()) {
               break;
             }
           }
         }
 
-        surplusExtra.columnKeySet().removeAll(serversToRemove);
+        if (serversToRemove.size() > 0) {
+          surplusExtra.columnKeySet().removeAll(serversToRemove);
+        }
+
         for (Pair<String,TServerInstance> pair : serversGroupsToRemove) {
           surplusExtra.remove(pair.getFirst(), pair.getSecond());
+        }
+
+        if (moves.size() >= getMaxMigrations()) {
+          break;
         }
       }
     }
   }
 
-  private void balanceExtraMultiple(Map<TServerInstance,TserverGroupInfo> tservers, int maxExtraGroups, Moves moves) {
+  private boolean balanceExtraMultiple(Map<TServerInstance,TserverGroupInfo> tservers, int maxExtraGroups, Moves moves) {
     Multimap<String,TserverGroupInfo> extraMultiple = HashMultimap.create();
 
     for (TserverGroupInfo tgi : tservers.values()) {
@@ -517,10 +566,23 @@ public abstract class GroupBalancer extends TabletBalancer {
       }
     }
 
+    balanceExtraMultiple(tservers, maxExtraGroups, moves, extraMultiple, false);
+    if (moves.size() < getMaxMigrations() && extraMultiple.size() > 0) {
+      // no place to move so must exceed maxExtra temporarily... subsequent balancer calls will smooth things out
+      balanceExtraMultiple(tservers, maxExtraGroups, moves, extraMultiple, true);
+      return false;
+    } else {
+      return true;
+    }
+  }
+
+  private void balanceExtraMultiple(Map<TServerInstance,TserverGroupInfo> tservers, int maxExtraGroups, Moves moves,
+      Multimap<String,TserverGroupInfo> extraMultiple, boolean alwaysAdd) {
+
     ArrayList<Pair<String,TserverGroupInfo>> serversToRemove = new ArrayList<>();
     for (TserverGroupInfo destTgi : tservers.values()) {
       Map<String,Integer> extras = destTgi.getExtras();
-      if (extras.size() < maxExtraGroups) {
+      if (alwaysAdd || extras.size() < maxExtraGroups) {
         serversToRemove.clear();
         for (String group : extraMultiple.keySet()) {
           if (!extras.containsKey(group)) {
@@ -536,7 +598,7 @@ public abstract class GroupBalancer extends TabletBalancer {
               serversToRemove.add(new Pair<String,TserverGroupInfo>(group, srcTgi));
             }
 
-            if (destTgi.getExtras().size() >= maxExtraGroups) {
+            if (destTgi.getExtras().size() >= maxExtraGroups || moves.size() >= getMaxMigrations()) {
               break;
             }
           }
@@ -546,7 +608,7 @@ public abstract class GroupBalancer extends TabletBalancer {
           extraMultiple.remove(pair.getFirst(), pair.getSecond());
         }
 
-        if (extraMultiple.size() == 0) {
+        if (extraMultiple.size() == 0 || moves.size() >= getMaxMigrations()) {
           break;
         }
       }
@@ -598,7 +660,7 @@ public abstract class GroupBalancer extends TabletBalancer {
               emptyServerGroups.add(new Pair<String,TServerInstance>(group, srcTgi.getTserverInstance()));
             }
 
-            if (destTgi.getExtras().size() >= expectedExtra) {
+            if (destTgi.getExtras().size() >= expectedExtra || moves.size() >= getMaxMigrations()) {
               break;
             }
           }
@@ -612,6 +674,9 @@ public abstract class GroupBalancer extends TabletBalancer {
           extraSurplus.remove(pair.getFirst(), pair.getSecond());
         }
 
+        if (moves.size() >= getMaxMigrations()) {
+          break;
+        }
       }
     }
   }
@@ -650,19 +715,26 @@ public abstract class GroupBalancer extends TabletBalancer {
           numToMove -= transfer;
 
           moves.move(group, transfer, surplusTsi, defecitTsi);
+          if (moves.size() >= getMaxMigrations()) {
+            return;
+          }
         }
       }
     }
   }
 
-  private void populateMigrations(SortedMap<TServerInstance,TabletServerStatus> current, List<TabletMigration> migrationsOut, Moves moves) {
+  private void populateMigrations(Set<TServerInstance> current, List<TabletMigration> migrationsOut, Moves moves) {
+    if (moves.size() == 0) {
+      return;
+    }
+
     Function<KeyExtent,String> partitioner = getPartitioner();
 
     for (Pair<KeyExtent,Location> entry : getLocationProvider()) {
       String group = partitioner.apply(entry.getFirst());
       Location loc = entry.getSecond();
 
-      if (loc.equals(Location.NONE) || !current.containsKey(loc.getTserverInstance())) {
+      if (loc.equals(Location.NONE) || !current.contains(loc.getTserverInstance())) {
         migrationsOut.clear();
         return;
       }
@@ -670,6 +742,9 @@ public abstract class GroupBalancer extends TabletBalancer {
       TServerInstance dest = moves.removeMove(loc.getTserverInstance(), group);
       if (dest != null) {
         migrationsOut.add(new TabletMigration(entry.getFirst(), loc.getTserverInstance(), dest));
+        if (moves.size() == 0) {
+          break;
+        }
       }
     }
   }
