@@ -1,3 +1,5 @@
+#!/bin/bash
+
 #run this script before initializing fluo
 
 mvn package
